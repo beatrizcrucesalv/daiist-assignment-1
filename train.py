@@ -15,12 +15,15 @@ STEP 2: chronological split + cleaning decisions.
 STEP 3: feature engineering.
 STEP 4: scaling, naive baselines, scikit-learn model.
 STEP 5: manual PyTorch loop (raw tensors, autograd, hand update).
-STEP 6 (this version): standard PyTorch workflow (nn.Module + torch.optim).
-Next steps: final comparison on test -> save artifacts.
+STEP 6: standard PyTorch workflow (nn.Module + torch.optim).
+STEP 7 (this version): final comparison on the test set + save artifacts for app.py.
+Next: app.py (dashboard that only loads what is saved here).
 """
 
+import json
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -30,6 +33,7 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "data" / "hour.csv"
+ARTIFACT_DIR = ROOT / "artifacts"  # everything app.py needs is saved here
 SEED = 0
 TARGET = "cnt"
 
@@ -56,9 +60,11 @@ ALPHAS = [0.01, 0.1, 1, 10, 100]
 
 # Learning rates tried for the PyTorch models (also chosen on validation), and
 # the number of full passes over the training data. The weights start at zero,
-# so there is no randomness in the manual loop.
-LEARNING_RATES = [0.001, 0.01, 0.1]
-N_EPOCHS = 3000
+# so there is no randomness in the manual loop. With 156 correlated features,
+# gradient descent needs many steps to finish converging, and a learning rate
+# above about 0.23 (2 / the largest curvature of the loss) makes it blow up.
+LEARNING_RATES = [0.01, 0.1, 0.2]
+N_EPOCHS = 10000
 
 
 def set_seed(seed=SEED):
@@ -154,8 +160,9 @@ def build_features(df):
     """Turn a cleaned dataframe into the feature matrix X (all numeric).
 
     Kept on purpose: temp, hum, windspeed, yr, workingday, hour of day, month,
-    weather type. Left out on purpose (each can be added back to measure its
-    impact):
+    weather type, plus interactions of the hour with temperature and with the
+    year (separately for working days and weekends). Left out on purpose (adding
+    any of them back changed validation RMSE by less than 0.2):
       - atemp    : correlation 0.99 with temp, nearly the same information
       - season   : fully determined by the month
       - holiday  : workingday already is 0 on holidays
@@ -176,7 +183,18 @@ def build_features(df):
     months = one_hot(df["mnth"], list(range(1, 13)), "mnth")
     weather = one_hot(df["weathersit"], [1, 2, 3], "weather")
 
-    X = pd.concat([X, hours, hours_x_work, months, weather], axis=1)
+    # The daily curve is not the same in every situation: commuters ride more
+    # when it is warm, and the system grew between 2011 and 2012, so the peaks
+    # get higher. A plain linear model adds one fixed effect per hour and cannot
+    # show that. Multiplying each hour column by temperature and by the year
+    # lets the curve change with both, for working days and weekends separately.
+    interactions = []
+    for modifier in ["yr", "temp"]:
+        value = df[modifier].astype(float)
+        interactions.append(hours.mul(value, axis=0).add_suffix(f"_x_{modifier}"))
+        interactions.append(hours_x_work.mul(value, axis=0).add_suffix(f"_x_{modifier}"))
+
+    X = pd.concat([X, hours, hours_x_work, months, weather] + interactions, axis=1)
 
     # Safety nets: no forbidden column, no missing values.
     assert not set(LEAKAGE_COLS + ID_COLS) & set(X.columns)
@@ -332,6 +350,76 @@ def fit_nn(Xs_train, y_train, Xs_val, y_val, val):
     return best
 
 
+# Short keys (used in files) -> readable names (used in printed tables).
+MODEL_NAMES = {
+    "baseline_mean": "baseline: train mean",
+    "baseline_per_hour": "baseline: mean per hour",
+    "sklearn": "scikit-learn",
+    "manual": "manual PyTorch",
+    "nn": "nn.Module + optim",
+}
+
+
+def results_table(part, preds):
+    """One row of metrics per model, for one split."""
+    return [
+        evaluate_predictions(MODEL_NAMES[key], part[TARGET], pred, part)
+        for key, pred in preds.items()
+    ]
+
+
+def save_models(sk_model, scaler, w_manual, b_manual, manual_history,
+                nn_model, nn_history, feature_columns, cleaning_params,
+                chosen_hyperparameters):
+    """Save the trained models and everything needed to use them on new data."""
+    ARTIFACT_DIR.mkdir(exist_ok=True)
+    joblib.dump(sk_model, ARTIFACT_DIR / "sklearn_model.joblib")
+    joblib.dump(scaler, ARTIFACT_DIR / "scaler.joblib")
+    torch.save({"w": w_manual, "b": b_manual}, ARTIFACT_DIR / "manual_model.pt")
+    torch.save(nn_model.state_dict(), ARTIFACT_DIR / "nn_model.pt")
+
+    config = {
+        "feature_columns": list(feature_columns),
+        "cleaning_params": cleaning_params,
+        "chosen_hyperparameters": chosen_hyperparameters,
+        "peak_hours": PEAK_HOURS,
+        "loss_history_manual": [round(x, 3) for x in manual_history],
+        "loss_history_nn": [round(x, 3) for x in nn_history],
+    }
+    with open(ARTIFACT_DIR / "config.json", "w") as f:
+        json.dump(config, f)
+
+
+def save_predictions(val, test, val_preds, test_preds):
+    """Actual and predicted values for every model, for the dashboard plots."""
+    frames = []
+    for split_name, part, preds in [("val", val, val_preds), ("test", test, test_preds)]:
+        frame = part[["timestamp", "hr", "workingday"]].copy()
+        frame["actual"] = part[TARGET]
+        frame["split"] = split_name
+        for key, pred in preds.items():
+            frame[key] = np.clip(pred, 0, None)
+        frames.append(frame)
+    pd.concat(frames).to_csv(ARTIFACT_DIR / "predictions.csv", index=False)
+
+
+def save_processed_data(train, val, test):
+    """The cleaned data with its split label, for the distribution plots."""
+    columns = ["timestamp", "yr", "mnth", "hr", "workingday", "weathersit",
+               "temp", "hum", "windspeed", TARGET]
+    parts = []
+    for split_name, part in [("train", train), ("val", val), ("test", test)]:
+        part = part[columns].copy()
+        part["split"] = split_name
+        parts.append(part)
+    pd.concat(parts).to_csv(ARTIFACT_DIR / "processed_data.csv", index=False)
+
+
+def save_metrics(val_results, test_results):
+    with open(ARTIFACT_DIR / "metrics.json", "w") as f:
+        json.dump({"validation": val_results, "test": test_results}, f, indent=2)
+
+
 def main():
     set_seed()
     df = load_data()
@@ -396,8 +484,48 @@ def main():
     print("\nvalidation results (bikes per hour):")
     print(pd.DataFrame(results).round(1).to_string(index=False))
 
-    # TODO next step: final comparison on the test set, then save artifacts.
-    print("\nstep 6 done")
+    # ---- Step 7: the test set, looked at for the first and only time. ----
+    # Every choice (alpha, learning rates) was made on validation above, and the
+    # models were trained on train only, so this number is an honest estimate.
+    mean_test, hour_test = baseline_predictions(train, test)
+    X_test_t = to_tensor(Xs_test)
+    test_preds = {
+        "baseline_mean": mean_test,
+        "baseline_per_hour": hour_test,
+        "sklearn": sk_model.predict(Xs_test),
+        "manual": predict_manual(X_test_t, w_manual, b_manual),
+        "nn": predict_nn(nn_model, X_test_t),
+    }
+    val_preds = {
+        "baseline_mean": mean_val,
+        "baseline_per_hour": hour_val,
+        "sklearn": sk_val_pred,
+        "manual": manual_val_pred,
+        "nn": nn_val_pred,
+    }
+    val_results = results_table(val, val_preds)
+    test_results = results_table(test, test_preds)
+
+    print("\nTEST results (bikes per hour):")
+    print(pd.DataFrame(test_results).round(1).to_string(index=False))
+    print(f"  max |manual - scikit-learn| prediction gap on test: "
+          f"{np.abs(test_preds['manual'] - test_preds['sklearn']).max():.2f} bikes")
+    print(f"  max |nn - scikit-learn| prediction gap on test: "
+          f"{np.abs(test_preds['nn'] - test_preds['sklearn']).max():.2f} bikes")
+
+    # ---- Save everything app.py needs, so the app never retrains. ----
+    save_models(
+        sk_model, scaler, w_manual, b_manual, manual_history, nn_model, nn_history,
+        X_train.columns, cleaning_params,
+        {"alpha": sk_model.alpha, "manual_lr": manual_lr, "nn_lr": nn_lr,
+         "n_epochs": N_EPOCHS},
+    )
+    save_predictions(val, test, val_preds, test_preds)
+    save_processed_data(train, val, test)
+    save_metrics(val_results, test_results)
+    print("\nsaved to", ARTIFACT_DIR.name + "/:", sorted(p.name for p in ARTIFACT_DIR.iterdir()))
+
+    print("\nstep 7 done")
 
 
 if __name__ == "__main__":

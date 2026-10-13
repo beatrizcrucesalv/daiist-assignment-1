@@ -1,0 +1,66 @@
+{
+  "validation": [
+    {
+      "model": "baseline: train mean",
+      "RMSE": 246.20821310264049,
+      "MAE": 187.54205783598564,
+      "peak signed error": -377.45120055973985
+    },
+    {
+      "model": "baseline: mean per hour",
+      "RMSE": 187.56846277255931,
+      "MAE": 133.98099605844808,
+      "peak signed error": -271.5960149407887
+    },
+    {
+      "model": "scikit-learn",
+      "RMSE": 80.5051035601028,
+      "MAE": 56.91346982805888,
+      "peak signed error": -47.055658055000336
+    },
+    {
+      "model": "manual PyTorch",
+      "RMSE": 80.50480509651632,
+      "MAE": 56.91323026423485,
+      "peak signed error": -47.0555003792899
+    },
+    {
+      "model": "nn.Module + optim",
+      "RMSE": 80.50479728706208,
+      "MAE": 56.91322139565324,
+      "peak signed error": -47.05544095720563
+    }
+  ],
+  "test": [
+    {
+      "model": "baseline: train mean",
+      "RMSE": 243.70722033941237,
+      "MAE": 179.47586217320978,
+      "peak signed error": -366.9613868951436
+    },
+    {
+      "model": "baseline: mean per hour",
+      "RMSE": 189.39025355913668,
+      "MAE": 130.28845680313253,
+      "peak signed error": -260.89197526177617
+    },
+    {
+      "model": "scikit-learn",
+      "RMSE": 93.3137749478044,
+      "MAE": 68.30824058277044,
+      "peak signed error": -71.48308466230304
+    },
+    {
+      "model": "manual PyTorch",
+      "RMSE": 93.3134210719593,
+      "MAE": 68.30800439020909,
+      "peak signed error": -71.48268498959749
+    },
+    {
+      "model": "nn.Module + optim",
+      "RMSE": 93.3133940956881,
+      "MAE": 68.30798790339004,
+      "peak signed error": -71.48265192888785
+    }
+  ]
+}
