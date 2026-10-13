@@ -13,9 +13,9 @@ Run with:  uv run python main.py train
 STEP 1: load the data, build a timestamp, report data quality.
 STEP 2: chronological split + cleaning decisions.
 STEP 3: feature engineering.
-STEP 4 (this version): scaling, naive baselines, scikit-learn model.
-Next steps: manual PyTorch -> nn.Module + optim -> final comparison on test
--> save artifacts.
+STEP 4: scaling, naive baselines, scikit-learn model.
+STEP 5 (this version): manual PyTorch loop (raw tensors, autograd, hand update).
+Next steps: nn.Module + optim -> final comparison on test -> save artifacts.
 """
 
 from pathlib import Path
@@ -51,6 +51,12 @@ PEAK_HOURS = [7, 8, 9, 16, 17, 18, 19]
 # Regularization strengths tried for the scikit-learn model (chosen on the
 # validation set, never on the test set).
 ALPHAS = [0.01, 0.1, 1, 10, 100]
+
+# Learning rates tried for the PyTorch models (also chosen on validation), and
+# the number of full passes over the training data. The weights start at zero,
+# so there is no randomness in the manual loop.
+LEARNING_RATES = [0.001, 0.01, 0.1]
+N_EPOCHS = 3000
 
 
 def set_seed(seed=SEED):
@@ -225,6 +231,59 @@ def fit_sklearn(Xs_train, y_train, Xs_val, y_val, val):
     return best_model
 
 
+def to_tensor(array):
+    """NumPy array -> float32 tensor (PyTorch trains in float32)."""
+    return torch.tensor(np.asarray(array), dtype=torch.float32)
+
+
+def train_manual(X, y, lr, n_epochs=N_EPOCHS):
+    """Linear regression by gradient descent, written by hand (Session 5).
+
+    Model : y_pred = X @ w + b
+    Loss  : mean squared error
+    Update: w <- w - lr * dLoss/dw, computed by autograd, applied by us.
+    """
+    w = torch.zeros(X.shape[1], requires_grad=True)
+    b = torch.zeros(1, requires_grad=True)
+    loss_history = []
+
+    for epoch in range(n_epochs):
+        y_pred = X @ w + b
+        loss = ((y_pred - y) ** 2).mean()
+        loss.backward()
+
+        with torch.no_grad():  # the update itself must not be tracked by autograd
+            w -= lr * w.grad
+            b -= lr * b.grad
+
+        w.grad.zero_()  # backward() accumulates gradients, so reset them every step
+        b.grad.zero_()
+        loss_history.append(loss.item())
+
+    return w.detach(), b.detach(), loss_history
+
+
+def predict_manual(X, w, b):
+    with torch.no_grad():
+        return (X @ w + b).numpy()
+
+
+def fit_manual(Xs_train, y_train, Xs_val, y_val, val):
+    """Train the manual loop for each learning rate; keep the best on validation."""
+    X_t, y_t, X_v = to_tensor(Xs_train), to_tensor(y_train), to_tensor(Xs_val)
+
+    best = None
+    best_rmse = np.inf
+    for lr in LEARNING_RATES:
+        w, b, history = train_manual(X_t, y_t, lr)
+        rmse = evaluate_predictions("tmp", y_val, predict_manual(X_v, w, b), val)["RMSE"]
+        print(f"  lr {lr:<6}: final train loss {history[-1]:8.1f}, validation RMSE {rmse:.2f}")
+        if rmse < best_rmse:
+            best, best_rmse = (w, b, history, lr), rmse
+    print(f"  chosen lr: {best[3]}")
+    return best
+
+
 def main():
     set_seed()
     df = load_data()
@@ -260,11 +319,25 @@ def main():
     sk_model = fit_sklearn(Xs_train, y_train, Xs_val, y_val, val)
     results.append(evaluate_predictions("scikit-learn", y_val, sk_model.predict(Xs_val), val))
 
+    print("\nmanual PyTorch loop:")
+    w_manual, b_manual, manual_history, manual_lr = fit_manual(
+        Xs_train, y_train, Xs_val, y_val, val
+    )
+    manual_val_pred = predict_manual(to_tensor(Xs_val), w_manual, b_manual)
+    results.append(evaluate_predictions("manual PyTorch", y_val, manual_val_pred, val))
+
+    # Do the two implementations agree? Same model, same data: they should.
+    sk_val_pred = sk_model.predict(Xs_val)
+    print(f"  max |manual - scikit-learn| prediction gap on validation: "
+          f"{np.abs(manual_val_pred - sk_val_pred).max():.2f} bikes")
+    print(f"  max |manual - scikit-learn| weight gap: "
+          f"{np.abs(w_manual.numpy() - sk_model.coef_).max():.3f}")
+
     print("\nvalidation results (bikes per hour):")
     print(pd.DataFrame(results).round(1).to_string(index=False))
 
-    # TODO next step: manual PyTorch loop, then nn.Module + torch.optim.
-    print("\nstep 4 done")
+    # TODO next step: nn.Module + torch.optim.
+    print("\nstep 5 done")
 
 
 if __name__ == "__main__":
