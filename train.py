@@ -14,8 +14,9 @@ STEP 1: load the data, build a timestamp, report data quality.
 STEP 2: chronological split + cleaning decisions.
 STEP 3: feature engineering.
 STEP 4: scaling, naive baselines, scikit-learn model.
-STEP 5 (this version): manual PyTorch loop (raw tensors, autograd, hand update).
-Next steps: nn.Module + optim -> final comparison on test -> save artifacts.
+STEP 5: manual PyTorch loop (raw tensors, autograd, hand update).
+STEP 6 (this version): standard PyTorch workflow (nn.Module + torch.optim).
+Next steps: final comparison on test -> save artifacts.
 """
 
 from pathlib import Path
@@ -23,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
@@ -284,6 +286,52 @@ def fit_manual(Xs_train, y_train, Xs_val, y_val, val):
     return best
 
 
+def train_nn(X, y, lr, n_epochs=N_EPOCHS):
+    """The same linear regression, with the standard PyTorch workflow.
+
+    nn.Linear holds w and b for us, torch.optim.SGD applies the update
+    w <- w - lr * grad (the exact rule we wrote by hand), and
+    optimizer.zero_grad() / optimizer.step() replace the manual bookkeeping.
+    """
+    torch.manual_seed(SEED)  # nn.Linear starts from random weights
+    model = nn.Linear(X.shape[1], 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    loss_history = []
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()                # replaces the manual .grad.zero_()
+        y_pred = model(X).squeeze(-1)        # (n, 1) -> (n,)
+        loss = loss_fn(y_pred, y)
+        loss.backward()
+        optimizer.step()                     # replaces the manual no_grad update
+        loss_history.append(loss.item())
+
+    return model, loss_history
+
+
+def predict_nn(model, X):
+    model.eval()
+    with torch.no_grad():
+        return model(X).squeeze(-1).numpy()
+
+
+def fit_nn(Xs_train, y_train, Xs_val, y_val, val):
+    """Train the nn.Module workflow for each learning rate; keep the best on validation."""
+    X_t, y_t, X_v = to_tensor(Xs_train), to_tensor(y_train), to_tensor(Xs_val)
+
+    best = None
+    best_rmse = np.inf
+    for lr in LEARNING_RATES:
+        model, history = train_nn(X_t, y_t, lr)
+        rmse = evaluate_predictions("tmp", y_val, predict_nn(model, X_v), val)["RMSE"]
+        print(f"  lr {lr:<6}: final train loss {history[-1]:8.1f}, validation RMSE {rmse:.2f}")
+        if rmse < best_rmse:
+            best, best_rmse = (model, history, lr), rmse
+    print(f"  chosen lr: {best[2]}")
+    return best
+
+
 def main():
     set_seed()
     df = load_data()
@@ -333,11 +381,23 @@ def main():
     print(f"  max |manual - scikit-learn| weight gap: "
           f"{np.abs(w_manual.numpy() - sk_model.coef_).max():.3f}")
 
+    print("\nnn.Module + torch.optim:")
+    nn_model, nn_history, nn_lr = fit_nn(Xs_train, y_train, Xs_val, y_val, val)
+    nn_val_pred = predict_nn(nn_model, to_tensor(Xs_val))
+    results.append(evaluate_predictions("nn.Module + optim", y_val, nn_val_pred, val))
+
+    print(f"  max |nn - scikit-learn| prediction gap on validation: "
+          f"{np.abs(nn_val_pred - sk_val_pred).max():.2f} bikes")
+    print(f"  max |nn - manual| prediction gap on validation: "
+          f"{np.abs(nn_val_pred - manual_val_pred).max():.2f} bikes")
+    print(f"  max |nn - scikit-learn| weight gap: "
+          f"{np.abs(nn_model.weight.detach().numpy().ravel() - sk_model.coef_).max():.3f}")
+
     print("\nvalidation results (bikes per hour):")
     print(pd.DataFrame(results).round(1).to_string(index=False))
 
-    # TODO next step: nn.Module + torch.optim.
-    print("\nstep 5 done")
+    # TODO next step: final comparison on the test set, then save artifacts.
+    print("\nstep 6 done")
 
 
 if __name__ == "__main__":
